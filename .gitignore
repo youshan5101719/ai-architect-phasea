@@ -1,4 +1,5 @@
 .env
+agent.trace.log
 __pycache__/
 .venv/
 *.pyc

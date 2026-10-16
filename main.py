@@ -1,9 +1,15 @@
 import os
+from contextlib import asynccontextmanager
+from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from openai import OpenAI
 from pydantic import BaseModel, Field
+
+from agent_logging import agent_trace, setup_agent_logging, trace_file_path
+from agent_loop import run_agent_chat
+from web_search_tool import WEB_SEARCH_TOOL_DEFINITION
 
 load_dotenv()
 
@@ -29,7 +35,36 @@ class ChatResponse(BaseModel):
     content: str = Field(..., description="助手回复的文本内容。")
 
 
+class ToolProbeRequest(BaseModel):
+    user_message: str = Field(
+        default="Who won the Super Bowl?",
+        description="用户问题；用于探测模型是否会发起 web_search 工具调用。",
+    )
+
+
+class ToolProbeResponse(BaseModel):
+    finish_reason: str | None = Field(
+        None, description="模型结束原因，例如 tool_calls 或 stop。"
+    )
+    content: str | None = Field(None, description="若无工具调用时的文本回复。")
+    tool_calls: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="模型返回的工具调用列表（OpenAI tool_calls 结构）。",
+    )
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    setup_agent_logging()
+    agent_trace(
+        "[System] Agent logging enabled — POST /chat logs appear in THIS terminal "
+        f"(backup file: {trace_file_path()})"
+    )
+    yield
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="Hello API 入门示例",
     description="""
 ## 这个页面是干什么的？
@@ -76,6 +111,10 @@ app = FastAPI(
         {
             "name": "对话",
             "description": "调用 OpenAI 兼容的 Chat Completions API（模型 gpt-5）。",
+        },
+        {
+            "name": "工具",
+            "description": "Web 搜索工具定义与 LLM 工具调用探测。",
         },
     ],
     swagger_ui_parameters={
@@ -126,17 +165,67 @@ def hello(
     tags=["对话"],
     summary="Chat Completions 对话",
     description=(
-        "将请求体中的 **user_message** 发给远端 Chat Completions 接口（模型 **gpt-5**），"
-        "并返回助手回复文本，格式为 `{\"content\": \"...\"}`。"
+        "Agent 对话：模型可调用 **web_search**，最多 **3** 轮工具循环，"
+        "最终将助手文本以 `{\"content\": \"...\"}` 返回。控制台会输出 Agent 决策与工具结果日志。"
     ),
     response_description="成功：JSON 对象，字段 content 为助手回复。",
 )
 def chat(request: ChatRequest) -> ChatResponse:
+    agent_trace(f"[Agent] POST /chat user_message={request.user_message!r}")
+    client = get_chat_client()
+    try:
+        content = run_agent_chat(
+            client,
+            model=CHAT_MODEL,
+            user_message=request.user_message,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Agent 对话失败：{exc}",
+        ) from exc
+
+    if not content.strip():
+        raise HTTPException(status_code=502, detail="模型未返回文本内容。")
+
+    return ChatResponse(content=content)
+
+
+def _serialize_tool_calls(message: Any) -> list[dict[str, Any]]:
+    raw_calls = getattr(message, "tool_calls", None) or []
+    serialized: list[dict[str, Any]] = []
+    for call in raw_calls:
+        serialized.append(
+            {
+                "id": call.id,
+                "type": call.type,
+                "function": {
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                },
+            }
+        )
+    return serialized
+
+
+@app.post(
+    "/chat/tool-probe",
+    tags=["工具"],
+    summary="探测 LLM 是否会发起 web_search 工具调用",
+    description=(
+        "向模型注册 **web_search** 工具 schema，发送 **user_message**，"
+        "仅返回模型侧的 tool_calls（不调用 web_search、不跑 agent 循环）。"
+    ),
+    response_description="包含 tool_calls 与 finish_reason 的 JSON。",
+)
+def chat_tool_probe(request: ToolProbeRequest) -> ToolProbeResponse:
     client = get_chat_client()
     try:
         completion = client.chat.completions.create(
             model=CHAT_MODEL,
             messages=[{"role": "user", "content": request.user_message}],
+            tools=[WEB_SEARCH_TOOL_DEFINITION],
+            tool_choice="auto",
         )
     except Exception as exc:
         raise HTTPException(
@@ -144,8 +233,15 @@ def chat(request: ChatRequest) -> ChatResponse:
             detail=f"调用 Chat Completions API 失败：{exc}",
         ) from exc
 
-    message = completion.choices[0].message.content
-    if message is None:
-        raise HTTPException(status_code=502, detail="模型未返回文本内容。")
+    if not completion.choices:
+        raise HTTPException(status_code=502, detail="模型未返回任何候选回复。")
 
-    return ChatResponse(content=message)
+    choice = completion.choices[0]
+    message = choice.message
+    tool_calls = _serialize_tool_calls(message)
+
+    return ToolProbeResponse(
+        finish_reason=choice.finish_reason,
+        content=message.content,
+        tool_calls=tool_calls,
+    )
